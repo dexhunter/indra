@@ -274,45 +274,74 @@ def _cluster(logits: np.ndarray) -> list[list[int]]:
     n = logits.shape[0]
     if n == 0:
         return []
-    S = logits.astype(np.float64).copy()
+    S = (
+        logits.astype(np.float64, order="C")
+        if type(logits) is np.ndarray and logits.dtype.kind in "biufc"
+        else logits.astype(np.float64).copy()
+    )
+    if n == 1 and type(S) is np.ndarray and S.shape == (1, 1):
+        return [[0]]
     np.fill_diagonal(S, 0.0)
     size = np.ones(n)
-    alive = np.ones(n, bool)
+    dead = np.zeros(n, bool)
     members = [[i] for i in range(n)]
-    M = S.copy()  # mean logit between groups; -inf on the diagonal and dead groups
+    M = S.copy()
     np.fill_diagonal(M, -np.inf)
     best = M.argmax(1)
     best_v = M[np.arange(n), best]
+    native = type(M) is np.ndarray
+    sum_rows = list(S) if type(S) is np.ndarray and S.shape == (n, n) else None
+    sum_columns = list(S.T) if sum_rows is not None else None
+    mean_columns = M.T if native else None
+    argmax = best_v.argmax if type(best_v) is np.ndarray else None
     for _ in range(n - 1):
-        a = int(np.argmax(best_v))
+        a = int(argmax() if argmax is not None else np.argmax(best_v))
         b = int(best[a])
         if best_v[a] <= 0:
             break
-        a, b = min(a, b), max(a, b)
-        S[a] += S[b]
-        S[:, a] += S[:, b]
+        if a > b:
+            a, b = b, a
+        sum_row = sum_rows[a] if sum_rows is not None else S[a]
+        sum_row += sum_rows[b] if sum_rows is not None else S[b]
+        sum_column = sum_columns[a] if sum_columns is not None else S[:, a]
+        sum_column += sum_columns[b] if sum_columns is not None else S[:, b]
         S[a, a] = 0.0
-        size[a] += size[b]
-        alive[b] = False
+        dead[b] = True
         members[a] += members[b]
-        row = S[a] / (size[a] * size)
-        row[~alive] = -np.inf
+        merged_size = len(members[a])
+        size[a] = merged_size
+        row = sum_row / (merged_size * size)
+        row[dead] = -np.inf
         row[a] = -np.inf
-        M[a], M[:, a] = row, row
-        M[b], M[:, b] = -np.inf, -np.inf
+        if native:
+            M[a] = row
+            mean_columns[a] = row
+            mean_columns[b] = -np.inf
+        else:
+            M[a], M[:, a] = row, row
+            M[b], M[:, b] = -np.inf, -np.inf
         best_v[b] = -np.inf
-        best[a] = int(row.argmax())
-        best_v[a] = row[best[a]]
-        # other rows: (j, a) changed and (j, b) is gone
-        stale = alive & ((best == a) | (best == b))
+        best[b] = -1
+        k = int(row.argmax())
+        best[a] = k
+        best_v[a] = row[k]
+        stale = (best == a) | (best == b)
         stale[a] = False
-        for j in np.flatnonzero(stale):
-            best[j] = int(M[j].argmax())
-            best_v[j] = M[j, best[j]]
-        up = alive & (row > best_v)
-        up[a] = False
+        stale_ids = stale.nonzero()[0] if native else np.flatnonzero(stale)
+        if native and len(stale_ids) > 5:
+            partners = M[stale_ids].argmax(1)
+            best[stale_ids] = partners
+            best_v[stale_ids] = M[stale_ids, partners]
+        else:
+            for j in stale_ids.tolist() if native else stale_ids:
+                stale_row = M[j]
+                k = int(stale_row.argmax())
+                best[j] = k
+                best_v[j] = stale_row[k]
+        up = row > best_v
         best[up], best_v[up] = a, row[up]
-    return [sorted(members[i]) for i in range(n) if alive[i]]
+    return [sorted(members[i]) for i in range(n) if not dead[i]]
+
 
 
 def decode_blocks_order(
