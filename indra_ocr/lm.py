@@ -156,6 +156,13 @@ def _lse(a: float, b: float) -> float:
         return b
     if b == -math.inf:
         return a
+    if type(a) is float and type(b) is float:
+        if a > b:
+            if a != math.inf:
+                return a + math.log(1.0 + math.exp(b - a))
+        elif b != math.inf:
+            return b + math.log(math.exp(a - b) + 1.0)
+        return math.nan
     m = max(a, b)
     return m + math.log(math.exp(a - m) + math.exp(b - m))
 
@@ -176,79 +183,117 @@ def beam_search(
     included) and their log-probabilities; a class under ``cand_floor``
     probability at a step is not tried there.  Returns (token ids, the step
     where each token was first emitted)."""
+    ninf = -math.inf
     bits = lm.bits
     hmask = (1 << (bits * (lm.order - 1))) - 1
-    # prefix -> (log p ending in blank, log p ending in non-blank, lm score,
-    # steps, the prefix's last order - 1 tokens packed)
-    beams: dict = {(): (0.0, -math.inf, 0.0, (), 0)}
+    # Ordered (prefix, record) pairs. Records hold blank/non-blank log p,
+    # LM score, steps, packed history and a cached CTC total.
+    beams = [((), [0.0, ninf, 0.0, (), 0, 0.0])]
     log_skip = math.log(blank_skip)
     log_floor = math.log(cand_floor)
-    for t in range(len(blank)):
+    lse = _lse
+
+    def rank(item):
+        e = item[1]
+        return -(e[5] + e[2])
+
+    steps = range(len(blank))
+    # Ordinary numeric matrices can use Python scalars throughout the search.
+    native_rows = (
+        type(blank) is np.ndarray and blank.dtype == np.float64
+        and type(lm) is NgramLM
+        and type(topi) is np.ndarray and type(topv) is np.ndarray
+        and topi.ndim == topv.ndim == 2
+        and topi.dtype == np.int64 and topv.dtype == np.float64
+        and topi.shape[0] >= len(steps) and topv.shape[0] >= len(steps)
+    )
+    if native_rows:
+        topi, topv = topi.tolist(), topv.tolist()
+        if blank.ndim == 1:
+            blank = blank.tolist()
+
+        def lse(a, b, exp=math.exp, log=math.log, inf=math.inf, ninf=ninf):
+            if a == ninf:
+                return b
+            if b == ninf:
+                return a
+            if a > b:
+                if a != inf:
+                    return a + log(1.0 + exp(b - a))
+            elif b != inf:
+                return b + log(exp(a - b) + 1.0)
+            return math.nan
+    for t in steps:
         b0 = float(blank[t])
         if b0 > log_skip:
-            beams = {
-                p: (_lse(e[0], e[1]) + b0, -math.inf, e[2], e[3], e[4])
-                for p, e in beams.items()
-            }
+            for _, e in beams:
+                e[0] = e[5] + b0
+                e[1] = ninf
+                e[5] = e[0]
             continue
         nxt: dict = {}
 
-        def add(prefix, b, nb, s, st, hk):
-            old = nxt.get(prefix)
-            if old is None:
-                nxt[prefix] = (b, nb, s, st, hk)
-            else:
-                nxt[prefix] = (_lse(old[0], b), _lse(old[1], nb), *old[2:])
-
-        cands = [
-            (int(c), float(v))
-            for c, v in zip(topi[t], topv[t])
-            if c != 0 and v >= log_floor
-        ]
+        if native_rows:
+            cands = [
+                (c, v) for c, v in zip(topi[t], topv[t])
+                if c != 0 and v >= log_floor
+            ]
+        else:
+            cands = [
+                (int(c), float(v))
+                for c, v in zip(topi[t], topv[t])
+                if c != 0 and v >= log_floor
+            ]
         # Every beam's own entries first (the blank, and a repeat that collapses):
         # their scores only grow below, so with a full beam the lowest of them is
         # a floor; a new prefix that cannot reach it never enters the beam, and
         # its LM score is not looked up (the result is the same).
-        for prefix, (b, nb, s, st, hk) in beams.items():
-            add(prefix, _lse(b, nb) + b0, -math.inf, s, st, hk)
+        for prefix, (b, nb, s, st, hk, tot) in beams:
             last = prefix[-1] if prefix else None
+            repeat = ninf
             for c, lp in cands:
                 if c == last:
-                    add(prefix, -math.inf, nb + lp, s, st, hk)
+                    repeat = lse(repeat, nb + lp)
+            new_b = tot + b0
+            nxt[prefix] = [new_b, repeat, s, st, hk, new_b if repeat == ninf else lse(new_b, repeat)]
         floor = (
-            min(_lse(e[0], e[1]) + e[2] for e in nxt.values())
+            min(e[5] + e[2] for e in nxt.values())
             if len(beams) >= beam
-            else -math.inf
+            else ninf
         )
         reach = beta + alpha * lm.max_logp
-        ext = []  # (prefix, class, log p of the new token, lm score, steps, history)
-        for prefix, (b, nb, s, st, hk) in beams.items():
-            tot = _lse(b, nb)
+        cutoff = floor - 1e-9  # float slack
+        ext = []  # (extended prefix, log p, LM score, steps, history)
+        keys = []
+        for prefix, (b, nb, s, st, hk, tot) in beams:
             last = prefix[-1] if prefix else None
+            new_steps = None
             for c, lp in cands:
                 # after a blank, the same class is a new token
                 new_from = b + lp if c == last else tot + lp
-                if new_from == -math.inf:
+                if new_from == ninf:
                     continue
                 q = prefix + (c,)
-                if q in nxt:  # an existing beam: merges, its LM score stays
-                    add(q, -math.inf, new_from, s, st, hk)
-                elif new_from + s + reach >= floor - 1e-9:  # float slack
-                    ext.append((prefix, c, new_from, s, st, hk))
-        lps = lm.logp_keys([(e[5] << bits) | (e[1] + 1) for e in ext]) if ext else []
-        for (prefix, c, new_from, s, st, hk), lmp in zip(ext, lps):
-            add(
-                prefix + (c,),
-                -math.inf,
-                new_from,
-                s + alpha * lmp + beta,
-                st + (t,),
-                ((hk << bits) | (c + 1)) & hmask,
-            )
-        beams = dict(
-            sorted(nxt.items(), key=lambda kv: -(_lse(kv[1][0], kv[1][1]) + kv[1][2]))[
-                :beam
-            ]
-        )
-    best = max(beams.items(), key=lambda kv: _lse(kv[1][0], kv[1][1]) + kv[1][2])
+                old = nxt.get(q)
+                if old is not None:  # an existing beam: its LM score stays
+                    old[1] = lse(old[1], new_from)
+                    old[5] = lse(old[0], old[1])
+                elif new_from + s + reach >= cutoff:
+                    if new_steps is None:
+                        new_steps = st + (t,)
+                    key = (hk << bits) | (c + 1)
+                    ext.append((q, new_from, s, new_steps, key & hmask))
+                    keys.append(key)
+        lps = lm.logp_keys(keys) if ext else []
+        for (prefix, new_from, s, st, hk), lmp in zip(ext, lps):
+            score = s + alpha * lmp + beta
+            old = nxt.get(prefix)
+            if old is None:
+                nxt[prefix] = [ninf, new_from, score, st, hk, new_from]
+            else:
+                old[0] = lse(old[0], ninf)
+                old[1] = lse(old[1], new_from)
+                old[5] = lse(old[0], old[1])
+        beams = sorted(nxt.items(), key=rank)[:beam]
+    best = max(beams, key=lambda kv: kv[1][5] + kv[1][2])
     return list(best[0]), list(best[1][3])
